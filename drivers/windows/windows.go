@@ -20,6 +20,7 @@ import (
 	"sync"
 
 	"github.com/Microsoft/hcsshim"
+	"github.com/docker/docker/pkg/system"
 	"github.com/docker/libnetwork/datastore"
 	"github.com/docker/libnetwork/discoverapi"
 	"github.com/docker/libnetwork/driverapi"
@@ -30,21 +31,23 @@ import (
 
 // networkConfiguration for network specific configuration
 type networkConfiguration struct {
-	ID                 string
-	Type               string
-	Name               string
-	HnsID              string
-	RDID               string
-	VLAN               uint
-	VSID               uint
-	DNSServers         string
-	MacPools           []hcsshim.MacPool
-	DNSSuffix          string
-	SourceMac          string
-	NetworkAdapterName string
-	dbIndex            uint64
-	dbExists           bool
-	DisableGatewayDNS  bool
+	ID                    string
+	Type                  string
+	Name                  string
+	HnsID                 string
+	RDID                  string
+	VLAN                  uint
+	VSID                  uint
+	DNSServers            string
+	MacPools              []hcsshim.MacPool
+	DNSSuffix             string
+	SourceMac             string
+	NetworkAdapterName    string
+	dbIndex               uint64
+	dbExists              bool
+	DisableGatewayDNS     bool
+	EnableOutboundNat     bool
+	OutboundNatExceptions []string
 }
 
 // endpointConfiguration represents the user specified configuration for the sandbox endpoint
@@ -208,6 +211,18 @@ func (d *driver) parseNetworkOptions(id string, genericOptions map[string]string
 				return nil, err
 			}
 			config.VSID = uint(vsid)
+		case EnableOutboundNat:
+			if system.GetOSVersion().Build <= 16236 {
+				return nil, fmt.Errorf("Invalid network option. OutboundNat is not supported on this OS version")
+			}
+			b, err := strconv.ParseBool(value)
+			if err != nil {
+				return nil, err
+			}
+			config.EnableOutboundNat = b
+		case OutboundNatExceptions:
+			s := strings.Split(value, ",")
+			config.OutboundNatExceptions = s
 		}
 	}
 
@@ -350,6 +365,22 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 
 		config.HnsID = hnsresponse.Id
 		genData[HNSID] = config.HnsID
+
+	} else {
+		// Delete any stale HNS endpoints for this network.
+		if endpoints, err := hcsshim.HNSListEndpointRequest(); err == nil {
+			for _, ep := range endpoints {
+				if ep.VirtualNetwork == config.HnsID {
+					logrus.Infof("Removing stale HNS endpoint %s", ep.Id)
+					_, err = hcsshim.HNSEndpointRequest("DELETE", ep.Id, "")
+					if err != nil {
+						logrus.Warnf("Error removing HNS endpoint %s", ep.Id)
+					}
+				}
+			}
+		} else {
+			logrus.Warnf("Error listing HNS endpoints for network %s", config.HnsID)
+		}
 	}
 
 	n, err := d.getNetwork(id)
@@ -608,6 +639,19 @@ func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo,
 	}
 
 	endpointStruct.DisableICC = epOption.DisableICC
+
+	// Inherit OutboundNat policy from the network
+	if n.config.EnableOutboundNat {
+		outboundNatPolicy, err := json.Marshal(hcsshim.OutboundNatPolicy{
+			Policy:     hcsshim.Policy{Type: hcsshim.OutboundNat},
+			Exceptions: n.config.OutboundNatExceptions,
+		})
+
+		if err != nil {
+			return err
+		}
+		endpointStruct.Policies = append(endpointStruct.Policies, outboundNatPolicy)
+	}
 
 	configurationb, err := json.Marshal(endpointStruct)
 	if err != nil {
